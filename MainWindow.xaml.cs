@@ -3,8 +3,10 @@ using System.Collections.ObjectModel;
 using System.IO;
 using System.IO.Compression;
 using System.Linq;
+using System.Net;
 using System.Net.Http;
 using System.Runtime.InteropServices;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
@@ -22,13 +24,18 @@ namespace TWICDBAggregator
         private static readonly DateTime FirstKnownDate = new(2012, 9, 4);
         private const int MaxLogEntries = 200;
         private static readonly Uri TwicBaseUri = new("http://www.theweekinchess.com/zips/");
+        private static readonly Uri TwicBaseUriHttpsFallback = new("https://www.theweekinchess.com/zips/");
         private const int DownloadTimeoutSeconds = 120;
         private const int BufferSize = 131072; // 128KB - more optimal for modern systems
 
         private readonly ObservableCollection<string> logEntries = new();
         private readonly HttpClient httpClient;
+        private readonly string appDataPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "TWICDBAggregator");
+        private readonly string settingsFilePath;
         private CancellationTokenSource? buildCts;
         private readonly object buildLock = new();
+        private AppSettings settings = new();
+        private bool isRestoringSettings;
         private int totalIssues;
         private int addedIssues;
         private int skippedIssues;
@@ -63,6 +70,8 @@ namespace TWICDBAggregator
             };
             
             httpClient.DefaultRequestHeaders.UserAgent.ParseAdd("TWICDBAggregator/1.0 (+https://theweekinchess.com)");
+            Directory.CreateDirectory(appDataPath);
+            settingsFilePath = Path.Combine(appDataPath, "settings.json");
 
             calendarStart.DisplayDateStart = FirstKnownDate;
             calendarStart.DisplayDateEnd = DateTime.Now;
@@ -77,6 +86,7 @@ namespace TWICDBAggregator
             status.ItemsSource = logEntries;
             AppendLog("Ready. (Originally by Ross Hytnen)");
             
+            LoadSettings();
             // Initialization complete - now log date range changes
             isInitializing = false;
             
@@ -156,12 +166,93 @@ namespace TWICDBAggregator
             statusSkipped.Text = skippedIssues.ToString();
         }
 
+        private void LoadSettings()
+        {
+            try
+            {
+                if (!File.Exists(settingsFilePath))
+                    return;
+
+                string json = File.ReadAllText(settingsFilePath);
+                AppSettings? loaded = JsonSerializer.Deserialize<AppSettings>(json);
+                if (loaded == null)
+                    return;
+
+                isRestoringSettings = true;
+                settings = loaded;
+
+                if (settings.StartDate is DateTime start)
+                {
+                    DateTime clamped = ClampToRange(start);
+                    calendarStart.SelectedDate = clamped;
+                    calendarStart.DisplayDate = clamped;
+                }
+
+                if (settings.EndDate is DateTime end)
+                {
+                    DateTime clamped = ClampToRange(end);
+                    calendarEnd.SelectedDate = clamped;
+                    calendarEnd.DisplayDate = clamped;
+                }
+
+                if (!string.IsNullOrWhiteSpace(settings.OutputPath))
+                {
+                    textBoxFileName.Text = settings.OutputPath;
+                }
+
+                rbAppend.IsChecked = settings.Append;
+                rbCreateNew.IsChecked = !settings.Append;
+                stopOnSkip.IsChecked = settings.StopOnSkip;
+            }
+            catch (Exception ex) when (ex is IOException or JsonException or UnauthorizedAccessException)
+            {
+                AppendLog($"Could not load settings: {ex.Message}");
+            }
+            finally
+            {
+                isRestoringSettings = false;
+            }
+        }
+
+        private void SaveSettings()
+        {
+            if (isRestoringSettings)
+                return;
+
+            settings.StartDate = calendarStart.SelectedDate;
+            settings.EndDate = calendarEnd.SelectedDate;
+            settings.OutputPath = textBoxFileName.Text;
+            settings.Append = rbAppend.IsChecked == true;
+            settings.StopOnSkip = stopOnSkip.IsChecked == true;
+
+            try
+            {
+                string json = JsonSerializer.Serialize(settings, new JsonSerializerOptions { WriteIndented = true });
+                File.WriteAllText(settingsFilePath, json);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                AppendLog($"Could not save settings: {ex.Message}");
+            }
+        }
+
+        private static DateTime ClampToRange(DateTime date)
+        {
+            if (date < FirstKnownDate)
+                return FirstKnownDate;
+
+            if (date > DateTime.Today)
+                return DateTime.Today;
+
+            return date;
+        }
+
         /// <summary>
         /// Cleans out any leftover files.
         /// </summary>
         private void PurgeAppData()
         {
-            string path = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "TWICDBAggregator");
+            string path = appDataPath;
             if (!Directory.Exists(path))
             {
                 return;
@@ -199,12 +290,31 @@ namespace TWICDBAggregator
                 (first, second) = (second, first);
             }
 
+            // Stretch to the latest published archive when the end date is "today", starting from any cached knowledge.
+            if ((calendarEnd.SelectedDate ?? DateTime.Today).Date == DateTime.Today)
+            {
+                int startingProbe = Math.Max(second, settings.LatestKnownIssue ?? second);
+                if (settings.LatestKnownIssue.HasValue)
+                {
+                    AppendLog($"Using cached latest issue: {settings.LatestKnownIssue.Value} as starting point.");
+                }
+
+                int latestAvailable = await GetLatestAvailableIssueAsync(startingProbe, cancellationToken);
+                if (latestAvailable > second)
+                {
+                    second = latestAvailable;
+                    settings.LatestKnownIssue = latestAvailable;
+                    SaveSettings();
+                    AppendLog($"Latest TWIC issue detected: {latestAvailable}.");
+                }
+            }
+
             addedIssues = 0;
             skippedIssues = 0;
             totalIssues = Math.Max(0, (second - first) + 1);
             UpdateProgressCounters();
 
-            string path = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "TWICDBAggregator");
+            string path = appDataPath;
             Directory.CreateDirectory(path);
 
             FileMode fileMode = rbCreateNew.IsChecked == true ? FileMode.Create : FileMode.Append;
@@ -216,6 +326,7 @@ namespace TWICDBAggregator
             }
 
             bool wroteData = false;
+            bool updatedLatestIssue = false;
             for (int pgnNumber = first; pgnNumber <= second; pgnNumber++)
             {
                 cancellationToken.ThrowIfCancellationRequested();
@@ -223,12 +334,13 @@ namespace TWICDBAggregator
                 string baseName = $"twic{pgnNumber}";
                 string zipFilename = $"{baseName}g.zip";
                 string pgnFilename = $"{baseName}.pgn";
-                Uri url = new(TwicBaseUri, zipFilename);
+                Uri primaryUrl = new(TwicBaseUri, zipFilename);
+                Uri fallbackUrl = new(TwicBaseUriHttpsFallback, zipFilename);
 
                 string zipPath = Path.Combine(path, zipFilename);
                 string pgnPath = Path.Combine(path, pgnFilename);
 
-                if (!await DownloadZipAsync(url, zipPath, cancellationToken))
+                if (!await DownloadZipAsync(primaryUrl, zipPath, cancellationToken, fallbackUrl))
                 {
                     skippedIssues++;
                     UpdateProgressCounters();
@@ -267,7 +379,17 @@ namespace TWICDBAggregator
                 wroteData = true;
                 addedIssues++;
                 UpdateProgressCounters();
+                if (pgnNumber > (settings.LatestKnownIssue ?? 0))
+                {
+                    settings.LatestKnownIssue = pgnNumber;
+                    updatedLatestIssue = true;
+                }
                 TryCleanup(zipPath, pgnPath);
+            }
+
+            if (updatedLatestIssue)
+            {
+                SaveSettings();
             }
 
             // Ensure all data is flushed to disk
@@ -276,10 +398,89 @@ namespace TWICDBAggregator
             AppendLog(wroteData ? "Database build complete." : "No TWIC issues downloaded for the selected range.");
         }
 
+        private async Task<int> GetLatestAvailableIssueAsync(int startingIssue, CancellationToken cancellationToken)
+        {
+            int current = Math.Max(FirstKnownPgn, startingIssue);
+            int consecutiveMisses = 0;
+
+            while (consecutiveMisses < 2)
+            {
+                int candidate = current + 1;
+
+                if (await IssueExistsAsync(candidate, cancellationToken))
+                {
+                    current = candidate;
+                    consecutiveMisses = 0;
+                    continue;
+                }
+
+                consecutiveMisses++;
+            }
+
+            return current;
+        }
+
+        private async Task<bool> IssueExistsAsync(int issueNumber, CancellationToken cancellationToken)
+        {
+            string zipFilename = $"twic{issueNumber}g.zip";
+
+            foreach (Uri baseUri in new[] { TwicBaseUri, TwicBaseUriHttpsFallback })
+            {
+                Uri url = new(baseUri, zipFilename);
+
+                try
+                {
+                    using HttpRequestMessage headRequest = new(HttpMethod.Head, url);
+                    using HttpResponseMessage response = await httpClient.SendAsync(headRequest, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+                    if (response.IsSuccessStatusCode)
+                    {
+                        return true;
+                    }
+
+                    if (response.StatusCode == HttpStatusCode.MethodNotAllowed)
+                    {
+                        using HttpRequestMessage getRequest = new(HttpMethod.Get, url);
+                        using HttpResponseMessage getResponse = await httpClient.SendAsync(getRequest, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+                        if (getResponse.IsSuccessStatusCode)
+                        {
+                            return true;
+                        }
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch (Exception ex) when (ex is HttpRequestException or IOException)
+                {
+                    AppendLog($"Probe failed for {url}: {ex.Message}");
+                }
+            }
+
+            return false;
+        }
+
+        private class AppSettings
+        {
+            public DateTime? StartDate { get; set; }
+            public DateTime? EndDate { get; set; }
+            public string? OutputPath { get; set; }
+            public bool Append { get; set; }
+            public bool StopOnSkip { get; set; }
+            public int? LatestKnownIssue { get; set; }
+        }
+
         private async Task<FileStream?> OpenOutputStreamAsync(string outputPath, FileMode mode, CancellationToken cancellationToken)
         {
             try
             {
+                string? outputDirectory = Path.GetDirectoryName(outputPath);
+                if (!string.IsNullOrWhiteSpace(outputDirectory))
+                {
+                    // Ensure the destination directory exists before opening the file stream.
+                    Directory.CreateDirectory(outputDirectory);
+                }
+
                 var stream = new FileStream(outputPath, mode, FileAccess.Write, FileShare.Read, bufferSize: BufferSize, useAsync: true);
                 if (mode == FileMode.Append)
                 {
@@ -289,23 +490,33 @@ namespace TWICDBAggregator
                 await stream.FlushAsync(cancellationToken);
                 return stream;
             }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
             {
                 AppendLog($"Can't open database for writing: {ex.Message}");
                 return null;
             }
         }
 
-        private async Task<bool> DownloadZipAsync(Uri url, string destinationPath, CancellationToken cancellationToken)
+        private async Task<bool> DownloadZipAsync(Uri primaryUrl, string destinationPath, CancellationToken cancellationToken, Uri? fallbackUrl = null)
         {
-            try
+            static bool IsRedirectStatus(HttpStatusCode status) => (int)status >= 300 && (int)status < 400;
+
+            async Task<bool> TryDownloadAsync(Uri url)
             {
                 AppendLog($"Downloading {url}");
-                
+
                 using HttpResponseMessage response = await httpClient.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
                 if (!response.IsSuccessStatusCode)
                 {
-                    AppendLog($"Download failed ({(int)response.StatusCode} {response.ReasonPhrase}) for {url}");
+                    if (IsRedirectStatus(response.StatusCode) && fallbackUrl != null && url != fallbackUrl)
+                    {
+                        AppendLog($"Endpoint redirected ({(int)response.StatusCode} {response.ReasonPhrase}); retrying alternate endpoint...");
+                    }
+                    else
+                    {
+                        AppendLog($"Download failed ({(int)response.StatusCode} {response.ReasonPhrase}) for {url}");
+                    }
+
                     return false;
                 }
 
@@ -314,10 +525,17 @@ namespace TWICDBAggregator
                 await destination.FlushAsync(cancellationToken);
                 return true;
             }
+
+            try
+            {
+                if (await TryDownloadAsync(primaryUrl))
+                {
+                    return true;
+                }
+            }
             catch (TaskCanceledException ex) when (ex.CancellationToken != cancellationToken)
             {
-                // This is a timeout (not user cancellation)
-                AppendLog($"Download timed out for {url}");
+                AppendLog($"Download timed out for {primaryUrl}");
                 TryCleanup(destinationPath);
                 return false;
             }
@@ -327,10 +545,35 @@ namespace TWICDBAggregator
             }
             catch (Exception ex) when (ex is HttpRequestException or IOException)
             {
-                AppendLog($"Failed to download {url}: {ex.Message}");
+                AppendLog($"Failed to download {primaryUrl}: {ex.Message}");
                 TryCleanup(destinationPath);
-                return false;
             }
+
+            if (fallbackUrl != null && fallbackUrl != primaryUrl)
+            {
+                try
+                {
+                    AppendLog("Retrying download over HTTP...");
+                    return await TryDownloadAsync(fallbackUrl);
+                }
+                catch (TaskCanceledException ex) when (ex.CancellationToken != cancellationToken)
+                {
+                    AppendLog($"Download timed out for {fallbackUrl}");
+                    TryCleanup(destinationPath);
+                    return false;
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch (Exception ex) when (ex is HttpRequestException or IOException)
+                {
+                    AppendLog($"Failed to download {fallbackUrl}: {ex.Message}");
+                    TryCleanup(destinationPath);
+                }
+            }
+
+            return false;
         }
 
         private async Task<bool> ExtractFirstEntryAsync(string zipPath, string destinationPath, string expectedPgnName, CancellationToken cancellationToken)
@@ -418,6 +661,7 @@ namespace TWICDBAggregator
             
             // Don't dispose HttpClient immediately - give pending operations a chance to cancel gracefully
             // The finalizer will clean it up
+            SaveSettings();
             base.OnClosed(e);
         }
 

@@ -41,6 +41,7 @@ namespace TWICDBAggregator
             }
             
             ValidateData();
+            SaveSettings();
         }
 
         private void calendarEnd_SelectedDatesChanged(object sender, SelectionChangedEventArgs e)
@@ -71,6 +72,7 @@ namespace TWICDBAggregator
             }
             
             ValidateData();
+            SaveSettings();
         }
 
         /// <summary>
@@ -93,6 +95,7 @@ namespace TWICDBAggregator
             }
 
             ValidateData();
+            SaveSettings();
         }
 
         /// <summary>
@@ -115,6 +118,7 @@ namespace TWICDBAggregator
             }
             
             ValidateData();
+            SaveSettings();
         }
 
         /// <summary>
