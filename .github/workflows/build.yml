@@ -23,15 +23,20 @@ jobs:
       - name: Restore dependencies
         run: dotnet restore "TWICDBAggregator.sln"
 
-      - name: Build in Release
+      - name: Build in Release (framework-dependent)
         run: dotnet build "TWICDBAggregator.sln" --configuration Release --no-restore
 
-      - name: Publish app
-        run: dotnet publish "TWICDBAggregator.csproj" --configuration Release
+      - name: Publish self-contained single-file app
+        run: >
+          dotnet publish "TWICDBAggregator.csproj"
+          -c Release
+          -r win-x64
+          --self-contained true
+          /p:PublishSingleFile=true
 
-      - name: Upload build artifact
+      - name: Upload self-contained artifact
         uses: actions/upload-artifact@v4
         with:
-          name: TWICDBAggregator-win-x64
-          # Default publish output for your project:
-          path: bin/Release/net8.0-windows/publish/**
+          name: TWICDBAggregator-win-x64-self-contained
+          # Self-contained publish output
+          path: bin/Release/net8.0-windows/win-x64/publish/**
